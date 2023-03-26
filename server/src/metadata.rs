@@ -17,7 +17,7 @@
  */
 
 use datafusion::arrow::datatypes::Schema;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -30,12 +30,11 @@ use crate::storage::ObjectStorage;
 use self::error::stream_info::{CheckAlertError, LoadError, MetadataError};
 
 // TODO: make return type be of 'static lifetime instead of cloning
-lazy_static! {
-    #[derive(Debug)]
-    // A read-write lock to allow multiple reads while and isolated write
-    pub static ref STREAM_INFO: RwLock<HashMap<String, LogStreamMetadata>> =
-        RwLock::new(HashMap::new());
-}
+
+// A read-write lock to allow multiple reads while and isolated write
+pub static STREAM_INFO: Lazy<RwLock<HashMap<String, LogStreamMetadata>>> =
+    Lazy::new( || RwLock::new(HashMap::new()));
+
 
 #[derive(Debug, Default)]
 pub struct LogStreamMetadata {

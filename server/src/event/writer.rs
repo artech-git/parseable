@@ -18,7 +18,7 @@
  */
 
 use datafusion::arrow::{ipc::writer::StreamWriter, record_batch::RecordBatch};
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -32,10 +32,9 @@ use self::errors::StreamWriterError;
 type ArrowWriter<T> = StreamWriter<T>;
 type LocalWriter<T> = Mutex<Option<ArrowWriter<T>>>;
 
-lazy_static! {
-    #[derive(Default)]
-    pub static ref STREAM_WRITERS: RwLock<WriterTable<String, String, File>> = RwLock::new(WriterTable::new());
-}
+
+pub static STREAM_WRITERS: Lazy<RwLock<WriterTable<String, String, File>>> = Lazy::new( || RwLock::new(WriterTable::new()));
+
 
 impl STREAM_WRITERS {
     // append to a existing stream
@@ -117,6 +116,7 @@ impl STREAM_WRITERS {
     }
 }
 
+#[derive(Default)]
 pub struct WriterTable<A, B, T>
 where
     A: Eq + std::hash::Hash,

@@ -27,7 +27,8 @@ use chrono::{Local, NaiveDateTime, Timelike, Utc};
 use datafusion::arrow::error::ArrowError;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::parquet::errors::ParquetError;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
+
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
@@ -180,10 +181,10 @@ async fn create_remote_metadata(metadata: &StorageMetadata) -> Result<(), Object
     client.put_metadata(metadata).await
 }
 
-lazy_static! {
-    pub static ref CACHED_FILES: Mutex<FileTable<FileLink>> = Mutex::new(FileTable::new());
-    pub static ref STORAGE_RUNTIME: Arc<RuntimeEnv> = CONFIG.storage().get_datafusion_runtime();
-}
+
+pub static CACHED_FILES: Lazy<Mutex<FileTable<FileLink>>> = Lazy::new(|| Mutex::new(FileTable::new()));
+pub static STORAGE_RUNTIME: Lazy<Arc<RuntimeEnv>> = Lazy::new(|| CONFIG.storage().get_datafusion_runtime());
+
 
 impl CACHED_FILES {
     pub fn track_parquet(&self) {
