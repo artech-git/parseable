@@ -20,6 +20,7 @@ use clokwerk::{AsyncScheduler, Scheduler, TimeUnits};
 use thread_priority::{ThreadBuilder, ThreadPriority};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[cfg(feature = "debug")]
 use pyroscope::PyroscopeAgent;
@@ -46,6 +47,9 @@ mod stats;
 mod storage;
 mod utils;
 mod validator;
+mod tracing_config;
+
+use tracing_config::init_tracing_subscriber;
 
 use option::CONFIG;
 
@@ -54,6 +58,7 @@ const DEBUG_PYROSCOPE_URL: &str = "P_PROFILE_PYROSCOPE_URL";
 #[cfg(feature = "debug")]
 const DEBUG_PYROSCOPE_TOKEN: &str = "P_PROFILE_PYROSCOPE_AUTH_TOKEN";
 
+#[tracing::instrument]
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -65,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
     banner::print(&CONFIG, storage::StorageMetadata::global()).await;
     let prometheus = metrics::build_metrics_handler();
     CONFIG.storage().register_store_metrics(&prometheus);
+
+    let _gaurd_layer = init_tracing_subscriber().unwrap().init();
+
+    tracing::log::info!("Iam started you are awesome");
 
     migration::run_migration(&CONFIG).await?;
 
