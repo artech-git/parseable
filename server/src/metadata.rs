@@ -16,16 +16,16 @@
  *
  */
 
+use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::alerts::Alerts;
-use crate::event::Event;
 use crate::metrics::{EVENTS_INGESTED, EVENTS_INGESTED_SIZE};
-use crate::stats::{Stats, StatsCounter};
-use crate::storage::{MergedRecordReader, ObjectStorage, StorageDir};
+use crate::storage::{ObjectStorage, StorageDir};
+use crate::utils::arrow::MergedRecordReader;
 
 use self::error::stream_info::{CheckAlertError, LoadError, MetadataError};
 use derive_more::{Deref, DerefMut};
@@ -41,7 +41,6 @@ pub struct StreamInfo(RwLock<HashMap<String, LogStreamMetadata>>);
 pub struct LogStreamMetadata {
     pub schema: Arc<Schema>,
     pub alerts: Alerts,
-    pub stats: StatsCounter,
 }
 
 impl Default for LogStreamMetadata {
@@ -49,7 +48,6 @@ impl Default for LogStreamMetadata {
         Self {
             schema: Arc::new(Schema::empty()),
             alerts: Alerts::default(),
-            stats: StatsCounter::default(),
         }
     }
 }
@@ -64,16 +62,18 @@ pub const LOCK_EXPECT: &str = "no method in metadata should panic while holding 
 // 4. When first event is sent to stream (update the schema)
 // 5. When set alert API is called (update the alert)
 impl StreamInfo {
-    pub async fn check_alerts(&self, event: &Event) -> Result<(), CheckAlertError> {
+    pub async fn check_alerts(
+        &self,
+        stream_name: &str,
+        rb: RecordBatch,
+    ) -> Result<(), CheckAlertError> {
         let map = self.read().expect(LOCK_EXPECT);
         let meta = map
-            .get(&event.stream_name)
-            .ok_or(MetadataError::StreamMetaNotFound(
-                event.stream_name.to_owned(),
-            ))?;
+            .get(stream_name)
+            .ok_or(MetadataError::StreamMetaNotFound(stream_name.to_owned()))?;
 
         for alert in &meta.alerts.alerts {
-            alert.check_alert(event.stream_name.clone(), event.rb.clone())
+            alert.check_alert(stream_name, rb.clone())
         }
 
         Ok(())
@@ -129,15 +129,10 @@ impl StreamInfo {
         for stream in storage.list_streams().await? {
             let alerts = storage.get_alerts(&stream.name).await?;
             let schema = storage.get_schema(&stream.name).await?;
-            let stats = storage.get_stats(&stream.name).await?;
 
             let schema = Arc::new(update_schema_from_staging(&stream.name, schema));
 
-            let metadata = LogStreamMetadata {
-                schema,
-                alerts,
-                stats: stats.into(),
-            };
+            let metadata = LogStreamMetadata { schema, alerts };
 
             let mut map = self.write().expect(LOCK_EXPECT);
 
@@ -162,29 +157,13 @@ impl StreamInfo {
         size: u64,
         num_rows: u64,
     ) -> Result<(), MetadataError> {
-        let map = self.read().expect(LOCK_EXPECT);
-        let stream = map
-            .get(stream_name)
-            .ok_or(MetadataError::StreamMetaNotFound(stream_name.to_owned()))?;
-
-        stream.stats.add_ingestion_size(size);
-        stream.stats.increase_event_by_n(num_rows);
         EVENTS_INGESTED
             .with_label_values(&[stream_name, origin])
-            .inc();
+            .inc_by(num_rows);
         EVENTS_INGESTED_SIZE
             .with_label_values(&[stream_name, origin])
             .add(size as i64);
-
         Ok(())
-    }
-
-    pub fn get_stats(&self, stream_name: &str) -> Result<Stats, MetadataError> {
-        self.read()
-            .expect(LOCK_EXPECT)
-            .get(stream_name)
-            .map(|metadata| Stats::from(&metadata.stats))
-            .ok_or(MetadataError::StreamMetaNotFound(stream_name.to_owned()))
     }
 }
 

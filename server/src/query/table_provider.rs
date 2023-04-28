@@ -16,65 +16,41 @@
  *
  */
 
-#![allow(unused)]
-
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
-use datafusion::arrow::ipc::reader::StreamReader;
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::TableType;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
-use itertools::Itertools;
 use std::any::Any;
-use std::fs::File;
-use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::storage::staging::ReadBuf;
 use crate::storage::ObjectStorage;
+use crate::utils::arrow::adapt_batch;
 
 pub struct QueryTableProvider {
-    // parquet - ( arrow files )
-    staging_arrows: Vec<(PathBuf, Vec<PathBuf>)>,
-    other_staging_parquet: Vec<PathBuf>,
     storage_prefixes: Vec<String>,
     storage: Arc<dyn ObjectStorage + Send>,
+    readable_buffer: Vec<ReadBuf>,
     schema: Arc<Schema>,
 }
 
 impl QueryTableProvider {
     pub fn new(
-        staging_arrows: Vec<(PathBuf, Vec<PathBuf>)>,
-        other_staging_parquet: Vec<PathBuf>,
         storage_prefixes: Vec<String>,
         storage: Arc<dyn ObjectStorage + Send>,
+        readable_buffer: Vec<ReadBuf>,
         schema: Arc<Schema>,
     ) -> Self {
-        // By the time this query executes the arrow files could be converted to parquet files
-        // we want to preserve these files as well in case
-        let mut parquet_cached = crate::storage::CACHED_FILES.lock().expect("no poisoning");
-
-        for file in staging_arrows
-            .iter()
-            .map(|(p, _)| p)
-            .chain(other_staging_parquet.iter())
-        {
-            parquet_cached.upsert(file)
-        }
-
         Self {
-            staging_arrows,
-            other_staging_parquet,
             storage_prefixes,
             storage,
+            readable_buffer,
             schema,
         }
     }
@@ -86,37 +62,15 @@ impl QueryTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let mut mem_records: Vec<Vec<RecordBatch>> = Vec::new();
-        let mut parquet_files = Vec::new();
-
-        for (staging_parquet, arrow_files) in &self.staging_arrows {
-            if !load_arrows(arrow_files, &self.schema, &mut mem_records) {
-                parquet_files.push(staging_parquet.clone())
-            }
-        }
-
-        parquet_files.extend(self.other_staging_parquet.clone());
-
-        let memtable = MemTable::try_new(Arc::clone(&self.schema), mem_records)?;
-        let memexec = memtable.scan(ctx, projection, filters, limit).await?;
-
-        let cache_exec = if parquet_files.is_empty() {
-            memexec
-        } else {
-            match local_parquet_table(&parquet_files, &self.schema) {
-                Some(table) => {
-                    let listexec = table.scan(ctx, projection, filters, limit).await?;
-                    Arc::new(UnionExec::new(vec![memexec, listexec]))
-                }
-                None => memexec,
-            }
-        };
-
-        let mut exec = vec![cache_exec];
-
+        let memexec = self.get_mem_exec(ctx, projection, filters, limit).await?;
         let table = self
             .storage
             .query_table(self.storage_prefixes.clone(), Arc::clone(&self.schema))?;
+
+        let mut exec = Vec::new();
+        if let Some(memexec) = memexec {
+            exec.push(memexec);
+        }
 
         if let Some(ref storage_listing) = table {
             exec.push(
@@ -126,21 +80,39 @@ impl QueryTableProvider {
             );
         }
 
-        Ok(Arc::new(UnionExec::new(exec)))
-    }
-}
-
-impl Drop for QueryTableProvider {
-    fn drop(&mut self) {
-        let mut parquet_cached = crate::storage::CACHED_FILES.lock().expect("no poisoning");
-        for file in self
-            .staging_arrows
-            .iter()
-            .map(|(p, _)| p)
-            .chain(self.other_staging_parquet.iter())
-        {
-            parquet_cached.remove(file)
+        if exec.is_empty() {
+            Ok(Arc::new(EmptyExec::new(false, Arc::clone(&self.schema))))
+        } else {
+            Ok(Arc::new(UnionExec::new(exec)))
         }
+    }
+
+    async fn get_mem_exec(
+        &self,
+        ctx: &SessionState,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        if self.readable_buffer.is_empty() {
+            return Ok(None);
+        }
+
+        let mem_records: Vec<Vec<_>> = self
+            .readable_buffer
+            .iter()
+            .map(|r| {
+                r.buf
+                    .iter()
+                    .cloned()
+                    .map(|rb| adapt_batch(&self.schema, rb))
+                    .collect()
+            })
+            .collect();
+
+        let memtable = MemTable::try_new(Arc::clone(&self.schema), mem_records)?;
+        let memexec = memtable.scan(ctx, projection, filters, limit).await?;
+        Ok(Some(memexec))
     }
 }
 
@@ -168,60 +140,4 @@ impl TableProvider for QueryTableProvider {
         self.create_physical_plan(ctx, projection, filters, limit)
             .await
     }
-}
-
-fn local_parquet_table(parquet_files: &[PathBuf], schema: &SchemaRef) -> Option<ListingTable> {
-    let listing_options = ListingOptions {
-        file_extension: ".parquet".to_owned(),
-        format: Arc::new(ParquetFormat::default().with_enable_pruning(Some(true))),
-        file_sort_order: None,
-        infinite_source: false,
-        table_partition_cols: vec![],
-        collect_stat: true,
-        target_partitions: 1,
-    };
-
-    let paths = parquet_files
-        .iter()
-        .flat_map(|path| {
-            ListingTableUrl::parse(path.to_str().expect("path should is valid unicode"))
-        })
-        .collect_vec();
-
-    if paths.is_empty() {
-        return None;
-    }
-
-    let config = ListingTableConfig::new_with_multi_paths(paths)
-        .with_listing_options(listing_options)
-        .with_schema(Arc::clone(schema));
-
-    match ListingTable::try_new(config) {
-        Ok(table) => Some(table),
-        Err(err) => {
-            log::error!("Local parquet query failed due to err: {err}");
-            None
-        }
-    }
-}
-
-fn load_arrows(
-    files: &[PathBuf],
-    schema: &Schema,
-    mem_records: &mut Vec<Vec<RecordBatch>>,
-) -> bool {
-    let mut stream_readers = Vec::with_capacity(files.len());
-
-    for file in files {
-        let Ok(arrow_file) = File::open(file) else { return false; };
-        let Ok(reader)= StreamReader::try_new(arrow_file, None) else { return false; };
-        stream_readers.push(reader.into());
-    }
-
-    let reader = crate::storage::MergedRecordReader {
-        readers: stream_readers,
-    };
-    let records = reader.merged_iter(schema).collect();
-    mem_records.push(records);
-    true
 }
